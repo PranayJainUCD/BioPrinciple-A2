@@ -1,0 +1,359 @@
+---
+title: "Assignment 2"
+author: "Pranay Jain"
+date: "2024-12-20"
+output: html_document
+---
+
+## Untar the Dataset.
+
+This code chunk initializes the processing of a gene expression dataset by setting up the necessary file paths and extracting the downloaded archive. It ensures that the dataset is correctly prepared and organized for subsequent analysis tasks.
+
+```{r}
+# Processes a downloaded dataset for gene expression analysis.
+downloads_path  = "C:/Users/asus/Downloads"
+file_path = paste(downloads_path,"brca_tcga_pan_can_atlas_2018.tar.gz", 
+                  sep = "/" ) 
+untar(file_path)  # Extract the contents of the tar.gz file
+folder_path = paste(getwd(),"brca_tcga_pan_can_atlas_2018", sep = "/" )
+```
+
+## Load RNA Sequence Dataset.
+
+Next we will read the "data_mrna_seq_v2_rsem.txt" file to have available the RNA Sequence information. We load RNA-Seq data from the extracted dataset, preparing it for analysis. The tab-delimited data comes into a structured data frame where further processing will be done.
+
+```{r}
+# Load RNA-Seq data from the extracted dataset for analysis.
+path_rnaseq = paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/")
+data_rnaseq = read.delim(path_rnaseq)  # Read the RNA-Seq data into a data frame.
+```
+
+## Load Clinical Dataset of Patients.
+
+We load clinical data from the extracted dataset and do some preprocessing-removing unnecessary metadata rows-so that only the real patient records remain for analyses.
+
+```{r}
+# Load clinical data from the extracted dataset for analysis.
+data_patient_path = paste(folder_path,"data_clinical_patient.txt", sep = "/")
+data_patient = read.delim(data_patient_path)
+data_patient = data_patient[5:dim(data_patient)[1],] # Remove metadata rows by selecting rows from 5th to last.
+```
+
+## Load Copy Number Aberration (CNA) Dataset.
+
+The "data_cna.txt" file contains the details about Copy Number Aberration (CNA) for the patient's gene. Here, we read and load the CNA dataset.
+
+```{r}
+# Load the Copy Number Alteration (CNA) data.
+path_cna = paste(folder_path,"data_cna.txt", sep = "/")
+data_cna = read.delim(path_cna)
+```
+
+## Merge the Patient Identifiers from all 3 datasets.
+
+The following code chunk is used to clean and map the column names of CNA to the patient identifiers, having consistent formats and establishing the relationship between the clinical data and genetic information.
+
+```{r}
+# Clean and map CNA column names to patient identifiers.
+cleaned_colnames <- gsub("\\.$", "", gsub("\\.", "-", sub("(\\d{2})$", "", 
+                                        colnames(data_cna)[3:length(colnames(data_cna))])))  
+cleaned_colnames <- as.data.frame(cleaned_colnames)
+cleaned_colnames$id <- substr(cleaned_colnames$cleaned_colnames, 1, 
+                              nchar(cleaned_colnames$cleaned_colnames) - 1)  
+cleaned_colnames$cna_ids <- colnames(data_cna)[3:length(colnames(data_cna))]
+pat_id <- as.data.frame(data_patient$X.Patient.Identifier)  # Extract patient identifiers from the clinical data.
+colnames(pat_id) <- 'id'  # Rename the column to 'id' for consistency.
+identifier_patient = merge(cleaned_colnames, pat_id, by = "id", all = TRUE)  
+identifier_patient = na.omit(identifier_patient)  # Remove rows with missing values.
+```
+
+## Metadata Creation for ERBB2 Amplification.
+
+Now, we create metadata to processes RNA-Seq and CNA data into an analyzable format, such as converting data formats, extracting features, integrating clinical and genetic data into an analyzable format.
+
+```{r}
+# Process RNA-Seq and CNA data for downstream analysis.
+assay = round(as.matrix(data_rnaseq[,-c(1,2)]))  # Convert RNA-Seq data to a numeric matrix, rounding values.
+rownames(assay) = data_rnaseq[,1] 
+ERBB2_row = which(data_cna[, 1] == "ERBB2")
+ERBB2_data = matrix(data_cna[ERBB2_row, 3:ncol(data_cna)], 
+                    ncol = 1, 
+                    dimnames = list(colnames(data_cna)[3:ncol(data_cna)], "ERBB2_Count"))  
+matching_id <- colnames(assay)  # Extract the column names from the RNA-Seq matrix.
+ERBB2_filtered <- ERBB2_data[rownames(ERBB2_data) %in% colnames(assay), , drop = FALSE]  
+metadata = matrix(0, nrow = nrow(ERBB2_filtered), ncol = 1)  # Initialize a metadata matrix with zeros.
+colnames(metadata) = "HER2_Status"  # Name the metadata column as "HER2_Status".
+metadata[, 1] = ifelse(as.numeric(ERBB2_filtered[, "ERBB2_Count"]) > 0, 1, 0)  
+# Assign HER2 status: 1 if ERBB2 count > 0, otherwise 0.
+assay <- assay[, colnames(assay) %in% identifier_patient$cna_ids]
+```
+
+## Normalise Dataset.
+
+Now we must normalize the RNA data using the DeSeq package. We ensure that the necessary packages for differential expression analysis are installed and loaded. This pre-processes the RNA-Seq count data for missing and negative values, filters genes based on expression thresholds, and performs differential expression.
+
+```{r}
+# Ensure necessary packages are installed and loaded
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")  # Install BiocManager if not present
+
+if (!require("DESeq2", quietly = TRUE))
+  BiocManager::install("DESeq2")  # Install DESeq2 package if not already installed
+
+library(DESeq2)  # Load DESeq2 library for differential expression analysis
+
+# Data preprocessing: Handle missing and negative values in the count matrix
+assay[is.na(assay)] = 0  
+assay[assay < 0] = 0
+
+# Filter genes based on expression levels
+smallestGroupSize = 3
+keep = rowSums(assay >= 10) >= smallestGroupSize 
+assay = assay[keep,]
+
+# Create a DESeqDataSet and perform differential expression analysis
+dds =  DESeqDataSetFromMatrix(countData = assay,
+                              colData = metadata, 
+                              design = ~ HER2_Status)  
+dds <- DESeq(dds)  # Perform DESeq2 analysis
+resultsNames(dds)
+res = results(dds)  
+```
+
+## Perform Pathway Enrichment Analysis with Variance Stabilised Transformed Expression Values.
+
+Below, the DESeq2 dataset is transformed to stabilize the variance for plotting. Variability in the data is further explored in a Principal Component Analysis plot, colored by HER2 status.
+
+```{r}
+# Perform variance-stabilizing transformation on the DESeq2 dataset
+vsd = vst(dds)
+
+# Set up the plotting area for side-by-side plots
+par(mfrow = c(1, 2))
+
+# Generate a PCA plot using the variance-stabilized data
+plotPCA(vsd, intgroup = c("HER2_Status"))
+```
+
+## PCA Plot and Heatmap. (using vst values)
+
+We will carry out functional enrichment and pathway analysis for the differentially expressed genes that identify biological processes, KEGG pathways, and Reactome pathways that are enriched in the upregulated and downregulated genes, and visualize the results as dot plots and tree plots, including a heatmap of top differentially expressed genes.
+
+```{r}
+# Install required Bioconductor and CRAN packages if missing
+if (!requireNamespace("clusterProfiler", quietly = TRUE))
+  BiocManager::install("clusterProfiler")  # For GO and KEGG enrichment analysis
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+  BiocManager::install("org.Hs.eg.db")  # For human gene annotation
+
+if (!requireNamespace("enrichplot", quietly = TRUE))
+  install.packages("enrichplot")  # For plotting enrichment results
+
+# Load necessary libraries for enrichment and pathway analysis
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+
+# Filter significant results with adjusted p-value < 0.05
+res_sig = res[res$padj < 0.05,]
+
+# Separate upregulated and downregulated genes based on log2FoldChange
+DE_over = rownames(res_sig[res_sig$log2FoldChange > 0,])  # Upregulated genes
+DE_under = rownames(res_sig[res_sig$log2FoldChange < 0,])  # Downregulated genes
+
+# Perform Gene Ontology (GO) enrichment analysis for overexpressed genes
+go_results_over = enrichGO(
+  gene          = DE_over,          # Input gene set
+  OrgDb         = org.Hs.eg.db,     # Database for human genes
+  keyType       = "SYMBOL",         # Gene identifier type
+  ont           = "BP",             # Biological Process ontology
+  pAdjustMethod = "BH",             # Benjamini-Hochberg correction
+  pvalueCutoff  = 0.05,             # p-value threshold
+  qvalueCutoff  = 0.05              # q-value threshold
+)
+
+print(head(go_results_over))  # Display top GO enrichment results
+dotplot(go_results_over, showCategory = 10) + ggtitle("Gene Ontology Enrichment Overexpressed")
+
+# Perform Gene Ontology enrichment analysis for underexpressed genes
+go_results_under = enrichGO(
+  gene          = DE_under,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+dotplot(go_results_under, showCategory = 10) + ggtitle("Gene Ontology Enrichment Underexpressed")
+
+# Install additional packages for pathway analysis
+if (!requireNamespace("pathview", quietly = TRUE))
+  BiocManager::install("pathview")  # For pathway visualization
+
+if (!requireNamespace("ReactomePA", quietly = TRUE))
+  BiocManager::install("ReactomePA", force = TRUE, ask = FALSE)  # For Reactome pathway enrichment
+
+library(ReactomePA)
+library(pathview)
+
+# Map gene symbols to Entrez IDs for KEGG and Reactome pathway analysis
+gene_entrez_over <- bitr(
+  DE_over,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+gene_entrez_under <- bitr(
+  DE_under,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+# Perform KEGG pathway enrichment analysis
+kegg_results_over = enrichKEGG(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+kegg_results_under = enrichKEGG(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+print(head(kegg_results_over))
+dotplot(kegg_results_over, showCategory = 10) + ggtitle("KEGG Pathway Enrichment Overexpressed")
+print(head(kegg_results_under))
+dotplot(kegg_results_under, showCategory = 10) + ggtitle("KEGG Pathway Enrichment Underexpressed")
+
+# Perform Reactome pathway enrichment analysis
+reactome_results_over = enrichPathway(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+reactome_results_under = enrichPathway(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+print(head(reactome_results_over))
+dotplot(reactome_results_over, showCategory = 10) + ggtitle("Reactome Pathway Enrichment Overexpressed")
+print(head(reactome_results_under))
+dotplot(reactome_results_under, showCategory = 10) + ggtitle("Reactome Pathway Enrichment Underexpressed")
+
+# Create tree plots for enriched GO and KEGG pathways
+go_results_under_pw = pairwise_termsim(go_results_under)
+treeplot(go_results_under_pw) + ggtitle("GO Enrichment Underexpressed")
+
+kegg_results_under_pw = pairwise_termsim(kegg_results_under)
+treeplot(kegg_results_under_pw) + ggtitle("KEGG Enrichment Underexpressed")
+
+# Generate heatmap of top differentially expressed genes
+top_DE = order(res$padj)  # Order genes by adjusted p-value
+vsd_DE = assay(vsd)[top_DE[1:20],]  # Extract top 20 genes
+
+if (!requireNamespace("pheatmap", quietly = TRUE))
+  install.packages("pheatmap")  # Install pheatmap package if missing
+
+library(pheatmap)
+
+annotation_colors = list(HER2_Status = c(Her2_amplified = "#1f78b4", not_amplified = "#33a02c"))
+annotation_col = data.frame(HER2_Status = as.matrix(metadata[,1]))
+rownames(annotation_col) = colnames(vsd)
+
+pheatmap(
+  vsd_DE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = 'row',
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = annotation_col
+)
+```
+
+## Survival Model (using vst values of DE genes)
+
+Finally, we provide survival analysis and regularization with both clinical and RNA-Seq data. It maps identifiers, filters and preprocesses the data, and applies a regularized Cox proportional hazards model to compute the risk scores and classify patients into risk groups. Finally, Kaplan-Meier plots are drawn to visualize differences in survival.
+
+```{r}
+# Load necessary libraries for survival analysis and regularization
+library(survival)
+library(glmnet)
+
+# Map clinical and RNA-Seq identifiers
+mapping_table <- identifier_patient  
+id_mapping <- mapping_table[, c("id", "cna_ids")]  
+colnames(id_mapping) <- c("clinical_id", "rna_id") 
+clinical_ids <- data_patient$X.Patient.Identifier
+rna_ids <- colnames(vsd_DE)
+id_mapping <- id_mapping[id_mapping$clinical_id %in% clinical_ids & id_mapping$rna_id %in% rna_ids, ]  
+# Filter mappings to include only valid IDs
+
+# Filter clinical and RNA-Seq data
+clinical_data_filtered <- data_patient[data_patient$X.Patient.Identifier %in% id_mapping$clinical_id, ]  
+rna_seq_filtered <- vsd_DE[, colnames(vsd_DE) %in% id_mapping$rna_id] 
+rna_seq_filtered <- rna_seq_filtered[, match(id_mapping$rna_id, colnames(rna_seq_filtered))]  
+# Reorder columns to match RNA IDs in mapping
+all(colnames(rna_seq_filtered) == id_mapping$rna_id)  # Verify alignment of IDs
+
+# Prepare survival data
+time <- as.numeric(clinical_data_filtered$Overall.Survival..Months.)  # Extract survival times
+status <- ifelse(clinical_data_filtered$Overall.Survival.Status == "1:DECEASED", 1, 0)  
+# Encode survival status
+valid_indices <- time > 0  # Identify valid indices with positive survival times
+time <- time[valid_indices] 
+status <- status[valid_indices]
+rna_seq_filtered <- rna_seq_filtered[, valid_indices]
+
+# Transpose and scale RNA-Seq data
+x <- t(rna_seq_filtered)
+x <- x[rowSums(is.na(x)) == 0, ]
+x <- x[, colSums(is.na(x)) == 0]
+rownames(x) <- id_mapping$clinical_id[match(rownames(x), id_mapping$rna_id)]
+
+# Filter for common identifiers
+common_ids <- intersect(rownames(x), clinical_data_filtered$X.Patient.Identifier[valid_indices])  
+x <- x[common_ids, ]
+x <- scale(x)
+
+# Subset survival data to common IDs
+time <- time[clinical_data_filtered$X.Patient.Identifier[valid_indices] %in% common_ids]
+status <- status[clinical_data_filtered$X.Patient.Identifier[valid_indices] %in% common_ids]
+y <- Surv(time, status)  # Create survival object
+
+# Regularized Cox regression
+set.seed(123)  # Set seed for reproducibility
+fit <- glmnet(as.matrix(x), y, family = "cox", alpha = 0.5)  # Fit elastic net Cox model
+summary(fit)  # Print model details
+coef_matrix <- coef(fit, s = min(fit$lambda))  # Extract coefficients at minimum lambda
+risk_scores <- as.numeric(x %*% coef_matrix)  # Compute risk scores
+risk_groups <- ifelse(risk_scores > median(risk_scores), "High Risk", "Low Risk")  # Categorize risk groups
+
+# Kaplan-Meier survival analysis
+km_surv <- Surv(time, status)
+library(survminer)
+km_fit <- survfit(km_surv ~ risk_groups)
+ggsurvplot(km_fit, data = data.frame(time, status, risk_groups),
+           pval = TRUE, conf.int = TRUE,  
+           risk.table = TRUE, legend.title = "Risk Group",
+           main = "Kaplan-Meier Survival Curves by Risk Group",
+           xlab = "Time (Months)", ylab = "Survival Probability")  
+```
